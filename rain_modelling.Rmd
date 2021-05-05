@@ -1,0 +1,334 @@
+---
+title: "Predicting Rain"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r, echo=FALSE, results=FALSE}
+library(leaps)
+library(glmnet)
+library(pls)
+library(ggplot2)
+library(ISLR)
+library(dplyr)
+library(olsrr)
+library(pROC)
+```
+
+
+
+```{r}
+######Import Data, Use Brisbane, Set Predictor and Response Vars#######
+set.seed(5)
+weather<-read.table("weatherAUS.csv", sep=",", header=T)
+
+
+BrisRaw<-weather[weather$Location=="Brisbane",] #extract BNE
+sum(!complete.cases(BrisRaw)) #count incomplete/na rows
+BrisRaw<-na.omit(BrisRaw) #cut them
+str(BrisRaw) #everything is good
+
+Brisbane<-BrisRaw[,c(3:22,24)] #Remove a few columns
+Brisbane$RainToday<-Brisbane$RainToday=="Yes"
+Brisbane$RainTomorrow<-Brisbane$RainTomorrow=="Yes" #Change to Binary, rather than text factors
+
+
+Response<-Brisbane$RainTomorrow
+
+
+splitIndex<-sample(x=c("Train","Test"),size=nrow(Brisbane),replace=T,prob=c(0.7,0.3))
+
+testBrisbane<-Brisbane[splitIndex=="Test",]
+trainBrisbane<-Brisbane[splitIndex=="Train",]
+
+testResponse<-Response[splitIndex=="Test"]
+trainResponse<-Response[splitIndex=="Train"]
+
+
+
+
+```
+
+```{r}
+##########Accuracy, Sensitivity, Specificity, Positive Predictive Value and Negative Predictive Value#########
+
+#Model Accuracy Function
+acc <- function(x){
+  y <- ((x[1,1]+x[2,2])-(x[1,2]+x[2,1]))/
+  ((x[1,2]+x[2,1])+(x[1,1]+x[2,2]))
+  return(y)
+}
+sens<-function(x){
+  y<-x[2,2]/sum(x[2,])
+  return(y)
+}
+spec<-function(x){
+y<-x[1,1]/sum(x[1,])
+  return(y)
+}
+ppv<-function(x){
+  y<-x[2,2]/sum(x[,2])
+  return(y)
+}
+npv<-function(x){
+  y<-x[1,1]/sum(x[,1])
+  return(y)
+}
+
+analysis <- function(data){
+  assess <-c("Sensitivity"=sens(data), "Specificity"=
+  spec(data),"PPV"= ppv(data), "NPV"= npv(data),"Accuracy"=acc(data))
+  return(assess)
+}
+
+```
+
+
+
+```{r}
+#########Build Basic Model###########
+Basic<-lm(RainTomorrow~., data=trainBrisbane)
+AIC(Basic)
+olsvif<-ols_vif_tol(model = Basic) #Shows potential correlation between variables
+plot(Basic) #Clearly a Binomial problem
+
+##########Logit/Probit/Cloglog Transformations#######################
+#Logit
+logit<-glm(RainTomorrow~., family=binomial, data=trainBrisbane)
+#Probit
+probit<- glm(RainTomorrow~.,data=trainBrisbane ,family=binomial(link=probit))
+#cloglog
+clog<- glm(RainTomorrow~.,data=trainBrisbane,family=binomial(link=cloglog))
+
+logit
+probit
+clog
+
+#Probit Chosen due to lowest AIC and deviance
+plot(probit)
+
+
+
+
+#Probit confusion matrix
+probprobit <- predict(probit,newdata = testBrisbane, type = "response")
+probprobitBinary<-ifelse(probprobit>0.4,yes=1,no=0) #If 80% chance of rain = will rain
+
+brisconfmat<-table(probprobitBinary,testResponse)
+brisconfmat
+
+analysis(brisconfmat) #This provide us with baseline accuracy
+
+```
+
+
+
+```{r}
+######Stepwise variable Selection Using Logit########
+lmp <- probit
+lm0 <- glm(RainTomorrow ~ 1, family=binomial(link=probit), data= trainBrisbane)
+#Foward
+fwd <- step(lm0,scope=list(lower=lm0,upper=lmp), direction="forward",k=2,trace=0)
+#Backwards
+bck <- step(lmp,scope=list(lower=lm0,upper=lmp), direction="backward",k=2,trace=0)
+#Hybrid (Bidirectional) Method
+hyb <- step(lmp,scope=list(lower=lm0,upper=lmp), direction="both",k=2,trace=0)
+
+#compare
+fwd
+bck
+hyb
+
+
+#Back Stepwise has lowest AIC & Dev so it is the best fit - Use this for future models.
+plot(bck)
+
+probBCK <- predict(bck,newdata = testBrisbane, type = "response")
+probbckBinary<-ifelse(probBCK>0.4,yes=1,no=0) #If 40% chance of rain = will rain
+brisbckconfmat<-table(probbckBinary,testBrisbane$RainTomorrow)
+brisbckconfmat
+
+analysis(brisbckconfmat)
+
+```
+
+```{r}
+########Build Lasso, find min lambda (Deviance)########
+namesBck<-names(bck$coefficients)
+PredictMatrix<-model.matrix(RainTomorrow~.,Brisbane)[,-1]
+PredictBck<-PredictMatrix[,(colnames(PredictMatrix)%in%namesBck)]
+PredictBckDf<-as.data.frame(cbind(PredictBck,RainTomorrow=trainBrisbane$RainTomorrow))
+
+
+glm1<-glmnet(PredictMatrix,Response,alpha=1,family="binomial")
+cvglm1<-cv.glmnet(PredictMatrix,Response,alpha=1,family="binomial")
+lammin<-cvglm1$lambda.min
+
+plot(glm1, xvar="lambda") #looks too messy to comprehend, but variable coefs appear to converge to 0
+plot(cvglm1) #low deviance for a long period of time, this is good - cutting variables may be useful
+
+
+###########Using Min Lambda to build prediction model##########
+Prediction<-predict(glm1,type="coefficients",s=lammin)
+Prediction[,1] #lots of values at 0, hard to read - create list of non-zero variables
+PredictionShort<-list()
+count<-1
+for (i in 1:length(Prediction)){
+  if(Prediction[i]!=0){
+    PredictionShort[count]<-Prediction[i]
+    names(PredictionShort)[count]<-rownames(Prediction)[i]
+    count<-count+1
+    }
+}
+names(PredictionShort)
+
+LassoProb<-predict(glm1,s=lammin,newx=PredictMatrix,type="response")
+mean((LassoProb-Response)^2) #MSE
+LassoProbBinary<-ifelse(LassoProb>0.2,yes=1,no=0)
+LassoConf<-table(LassoProbBinary,Brisbane$RainTomorrow)
+
+
+analysis(LassoConf)
+```
+
+
+```{r}
+########Build Ridge, find min lambda (Deviance)########
+
+glmRidge<-glmnet(PredictMatrix,Response,alpha=0,family="binomial")
+cvglmRidge<-cv.glmnet(PredictMatrix,Response,alpha=0,family="binomial")
+lamminRidge<-cvglm1$lambda.min
+
+plot(glmRidge, xvar="lambda") #looks too messy to comprehend, but variable coefs appear to converge to 0
+plot(cvglmRidge) #low deviance for a long period of time, this is good - cutting variables may be useful
+
+
+###########Using Min Lambda to build prediction model##########
+PredictionRidge<-predict(glmRidge,type="coefficients",s=lammin)
+PredictionRidge[,1] #lots of values at 0, hard to read - create list of non-zero variables
+PredictionShortRidge<-list()
+count<-1
+for (i in 1:length(PredictionRidge)){
+  if(PredictionRidge[i]!=0){
+    PredictionShortRidge[count]<-PredictionRidge[i]
+    names(PredictionShortRidge)[count]<-rownames(PredictionRidge)[i]
+    count<-count+1
+    }
+}
+names(PredictionShortRidge)
+
+RidgeProb<-predict(glm1,s=lammin,newx=PredictMatrix,type="response")
+mean((RidgeProb-Response)^2) #MSE
+RidgeProbBinary<-ifelse(RidgeProb>0.2,yes=1,no=0)
+RidgeConf<-table(RidgeProbBinary,Brisbane$RainTomorrow)
+
+
+analysis(RidgeConf)
+```
+
+
+```{r}
+#ROC Plots (Probit, Backwards, Lasso)
+
+rocbuilder <- function(model){
+  roc<-plot.roc(trainBrisbane$RainTomorrow,fitted(model))
+  return(roc)
+}
+
+#Probit
+rocbuilder(probit)
+
+#Backwards Stepwise
+rocbuilder(bck)
+
+#Lasso
+lasso.auc<-cv.glmnet(PredictMatrix,Response,alpha=1,family="binomial", type.measure = "auc")
+
+plot(lasso.auc,
+     xlim=c(-4,-6))
+
+
+lasso.auc$cvm[match(lasso.auc$lambda.min,lasso.auc$lambda)]
+
+#Probit model has the highest AUC and is the best.
+
+```
+
+
+
+
+```{r}
+#Only use for new data
+
+#Extract Data
+extractor <- function(location){
+  raw<-weather[weather$Location==location,] 
+  raw<-na.omit(raw)
+
+  place<-raw[,c(3:22,24)]
+  place$RainToday<-place$RainToday=="Yes"
+  place$RainTomorrow<-place$RainTomorrow=="Yes"
+  Predictors<-place[,1:20]
+
+return(place)
+}
+
+#Build prediction matrix
+matrixbuilder <- function(newdata){
+  response<-newdata$RainTomorrow
+  ppred <- predict(object = probit, newdata=newdata, type = "response")
+  predictor<-c()
+  
+for (i in 1:length(ppred)){
+  if(ppred[i]<0.5){
+    predictor[i]<-0
+  }
+  else
+    predictor[i]<-1
+}
+
+cmatrix <- table(response,predictor)
+return(cmatrix)
+  
+}
+
+
+
+
+```
+
+
+```{r}
+##########Predict on other regions#######
+#Sydney
+Sydney <- extractor("Sydney")
+sydmat<- matrixbuilder(Sydney)
+sydmat
+analysis(sydmat)
+
+#Melbourne - Weird weather
+Melbourne<- extractor("Melbourne")
+melbmat<-matrixbuilder(Melbourne)
+melbmat
+analysis(melbmat)
+
+#Darwin - Hot & Dry
+Darwin<- extractor("Darwin")
+darwinmat<-matrixbuilder(Darwin)
+darwinmat
+analysis(darwinmat)
+
+
+#If above baseline accuracy (>58.21%) we agree that the model for predicting rain in Brisbance can be applied to other MAJOR cities with complete data sets.
+
+
+
+```
+
+
+
